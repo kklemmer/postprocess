@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "postprocess"
+version = "0.1.0"
+description = ""
+authors = ["Kerry <ksklemmer@gmail.com>"]
+license = "MIT"
+packages = [{ include = "postprocess" }]
+
+[tool.poetry.dependencies]
+numpy = ">=1.16.5, <1.23.0"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
