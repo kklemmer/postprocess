@@ -52,9 +52,9 @@ def load_cases_z0_dTdt():
                 cases[i,j]['u_hh'] = np.mean(np.sqrt(cases[i,j]['base'].budget['ubar'][...,14]**2 \
                                                     + cases[i,j]['base'].budget['vbar'][...,14]**2))
 
-    cases = np.reshape(cases, (len(dTdt) * len(z0),))
+    cases = list(np.reshape(cases, (len(dTdt) * len(z0),)))
 
-    df = pl.DataFrame(cases)
+    df = pl.from_dicts(cases)
 
     return df
                 
