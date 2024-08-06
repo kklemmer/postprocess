@@ -2,9 +2,16 @@ import polars as pl
 import padeopsIO as pio
 import numpy as np
 
-def load_cases_z0_dTdt():
+import seaborn as sns
+
+def load_cases_z0_dTdt(dTdt=[0, -0.25, -0.5, -0.75, -1], z0=[1, 10, 50]):
     """
     Load the budgets for the stability and z0 sweeps into a polars dataframe
+
+    INPUTS:
+    dTdt (optional) - list of surface cooling rates
+    z0 (optional)   - list of surface roughness lengths
+    if these are not set then all cases will be read in
     """
 
     # create cases dicts
@@ -14,9 +21,6 @@ def load_cases_z0_dTdt():
 
     cases = []
 
-    dTdt = [0, -0.25, -0.5, -0.75, -1]
-    z0 = [10]
-
 
     for i in range(len(dTdt)):
         for j in range(len(z0)):
@@ -24,10 +28,16 @@ def load_cases_z0_dTdt():
 
     cases = np.reshape(cases, (len(dTdt),len(z0)))
 
+    colors = sns.color_palette('mako', len(dTdt))
+
+    ls = [':', '-', '-.']   
+
     for i in range(len(dTdt)):
         for j in range(len(z0)):
             cases[i][j]['dTdt'] = dTdt[i]
             cases[i][j]['z0'] = z0[j]
+            cases[i,j]['color'] = colors[i]
+            cases[i,j]['ls'] = ls[j]
             if dTdt[i] == 0:
                 cases[i][j]['dir'] = base_dir + nbl_base_dir + 'z0_' + str(z0[j]) + 'cm'
                 cases[i][j]['Uref'] = 12
@@ -51,7 +61,18 @@ def load_cases_z0_dTdt():
                 cases[i,j]['base'].read_budgets(['ubar', 'vbar', 'Tbar'])
                 cases[i,j]['u_hh'] = np.mean(np.sqrt(cases[i,j]['base'].budget['ubar'][...,14]**2 \
                                                     + cases[i,j]['base'].budget['vbar'][...,14]**2))
-
+                
+    budget_terms_to_read = ['delta_u', 'delta_v', 'delta_w', 'xAdv_delta_base_mean',
+                        'xAdv_delta_base_fluc', 'xAdv_delta_delta_mean', 
+                        'xAdv_delta_delta_fluc', 'xAdv_base_delta_fluc', 'xAdv_base_delta_mean',
+                        'xCor', 'xSGS', 'dpdx', 'xAD']
+    for i in range(len(dTdt)):
+        for j in range(len(z0)):
+            cases[i,j]['base'].read_budgets(budget_terms=['ubar', 'vbar', 'wbar'])
+            cases[i,j]['deficit'].read_budgets(budget_terms=budget_terms_to_read)
+            # cases[i,j]['deficit_budget'].grad_calc(Lref=cases[i,j]['Lref'])
+            cases[i,j]['prim'].read_budgets(budget_terms=['ubar', 'vbar', 'wbar'])
+    
     cases = list(np.reshape(cases, (len(dTdt) * len(z0),)))
 
     df = pl.from_dicts(cases)
