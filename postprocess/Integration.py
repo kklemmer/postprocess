@@ -51,7 +51,7 @@ class Integration():
         return u_n1
 
 
-    def integrate(self, T=[0, 1], f=rk4_step): 
+    def integrate(self, u0=None, T=[0, 1], f=rk4_step): 
         """
         General integration function which calls a step function multiple times depending 
         on the parabolic integration strategy. 
@@ -76,10 +76,13 @@ class Integration():
         u(t) : (Nt, ...) array-like
             Solution to the parabolic ODE. 
         """
-        u0=self.physics.f0
+        if u0 is None:
+            u0=self.physics.f0
+      
         dudt=self.physics.dfdx
         dt = self.physics.dx
-        T = [self.physics.x[0], self.physics.x[-1]]
+
+        # T = [self.physics.x[0], self.physics.x[-2]]
 
         t = []
         ut = []
@@ -102,4 +105,3 @@ class Integration():
             t_n = t_n1
 
         return np.array(t), np.array(ut)
-            
