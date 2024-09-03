@@ -6,7 +6,7 @@ June 2024
 """
 import numpy as np
 from typing import Optional
-from utils import finite_diff, derivative_z_ghost_cells
+from postprocess.utils import finite_diff
 from padeopsIO import budget_utils
 from postprocess import TurbulenceModel
 
@@ -81,10 +81,13 @@ class Physics():
         xid = np.argmin(np.abs(self.x - x0))
         self.f0 = self.f[xid,...]
 
-    def dfdx(self, x, f): 
+    def dfdx(self, x, f, u=None, nuT=None): 
             """du/dt function"""
 
             xid = np.argmin(np.abs(self.x - x))
+
+            if u is None:
+                u = self.u[xid,...]
 
             dfdy = finite_diff(f.T, self.dy).T
             dfdz = finite_diff(f, self.dz)
@@ -94,7 +97,7 @@ class Physics():
                 # print(key)
                 rhs += val[xid,...]
 
-            return (rhs - self.v[xid,...] * dfdy - self.w[xid,...] * dfdz)/self.u[xid,...]
+            return (rhs - self.v[xid,...] * dfdy - self.w[xid,...] * dfdz)/u
         
 class WakeDeficitX(Physics):
     """
@@ -236,19 +239,16 @@ class WakeDeficitX(Physics):
                 self.v = (self.base_io.budget['vbar'])[xid,yid,zid]/self.Uref
                 self.w = (self.base_io.budget['wbar'])[xid,yid,zid]/self.Uref
 
-    def dfdx(self, x, f): 
+    def dfdx(self, x, f, nuT=None): 
             """du/dt function for delta u"""
             xid = np.argmin(np.abs(self.x - x))
             u = self.u[xid,...] + f
 
-            # dfdy = np.gradient(f, self.dy, axis=0)
-            # dfdz = np.gradient(f, self.dz, axis=1)
-
-            # dUdy = np.gradient(self.u[xid,...], self.dy, axis=0)
-            # dUdz = np.gradient(self.u[xid,...], self.dz, axis=1)
-
             dfdy = finite_diff(f.T, self.dy).T
             dfdz = finite_diff(f, self.dz)
+
+            if nuT is None:
+                nuT = self.nuT[xid,...]
 
             rhs = 0
             for key, val in self.rhs_terms.items():
@@ -256,8 +256,8 @@ class WakeDeficitX(Physics):
                     if self.turbulence_model == 'scott_nonlinear':
                         dUbdy = finite_diff(self.u[xid,...].T, self.dy).T  
                         dUbdz = finite_diff(self.u[xid,...], self.dz)
-                        self.rhs_terms['xturb_model'][xid,...] = finite_diff((self.nuT[xid,...] * (dfdy + dUbdy)).T, self.dy).T \
-                            + finite_diff(self.nuT[xid,...] * (dfdz + dUbdz), self.dz) \
+                        self.rhs_terms['xturb_model'][xid,...] = finite_diff(nuT* (dfdy + dUbdy).T, self.dy).T \
+                            + finite_diff(nuT * (dfdz + dUbdz), self.dz) \
                             + finite_diff((self.nuT_base[xid,...] * dfdy).T, self.dy).T \
                             + finite_diff(self.nuT_base[xid,...] * dfdz, self.dz)
                         
@@ -269,11 +269,11 @@ class WakeDeficitX(Physics):
                         self.rhs_terms['xturb_model'][xid,...] = finite_diff((self.nuT_y[xid,...] * (dfdy)).T, self.dy).T
 
                     elif self.turbulence_model == 'scott_nuT_z_only':
-                        self.rhs_terms['xturb_model'][xid,...] = finite_diff(self.nuT[xid,...] * (dfdz), self.dz)
+                        self.rhs_terms['xturb_model'][xid,...] = finite_diff(nuT * (dfdz), self.dz)
 
                     else:
-                        self.rhs_terms['xturb_model'][xid,...] = finite_diff((self.nuT[xid,...] * (dfdy)).T, self.dy).T \
-                                + finite_diff(self.nuT[xid,...] * (dfdz), self.dz)
+                        self.rhs_terms['xturb_model'][xid,...] = finite_diff((nuT * (dfdy)).T, self.dy).T \
+                                + finite_diff(nuT * (dfdz), self.dz)
 
                 rhs += val[xid,...]
                 # rhs += val[xid,...]
@@ -335,17 +335,18 @@ class WakeTKE(Physics):
             # self.io.read_budgets(budget_terms)
             self.base_io.read_budgets(['ubar', 'vbar', 'wbar', 'uu', 'vv', 'ww'])
             self.prim_io.read_budgets(['uu', 'vv', 'ww'])
-            self.base_io.read_budgets('budget3')
-            self.prim_io.read_budgets('budget3')
+            if 'TKE_shear_production_wake' not in self.io.budget:
+                self.base_io.read_budgets('budget3')
+                self.prim_io.read_budgets('budget3')
 
-            self.base_io.budget['TKE'] = 0.5 * (self.base_io.budget['uu'] + self.base_io.budget['vv'] + self.base_io.budget['ww'])
-            self.prim_io.budget['TKE'] = 0.5 * (self.prim_io.budget['uu'] + self.prim_io.budget['vv'] + self.prim_io.budget['ww'])
+                self.base_io.budget['TKE'] = 0.5 * (self.base_io.budget['uu'] + self.base_io.budget['vv'] + self.base_io.budget['ww'])
+                self.prim_io.budget['TKE'] = 0.5 * (self.prim_io.budget['uu'] + self.prim_io.budget['vv'] + self.prim_io.budget['ww'])
 
-            self.io.budget['TKE_wake'] = self.prim_io.budget['TKE'] - self.base_io.budget['TKE']
+                self.io.budget['TKE_wake'] = self.prim_io.budget['TKE'] - self.base_io.budget['TKE']
 
-            budget_terms = [term for term in self.prim_io.key if self.prim_io.key[term][0] == 3]
-            for term in budget_terms:
-                self.io.budget[term + '_wake'] = self.prim_io.budget[term] - self.base_io.budget[term]
+                budget_terms = [term for term in self.prim_io.key if self.prim_io.key[term][0] == 3]
+                for term in budget_terms:
+                    self.io.budget[term + '_wake'] = self.prim_io.budget[term] - self.base_io.budget[term]
 
             xid = self.xid  
             yid = self.yid
@@ -357,6 +358,8 @@ class WakeTKE(Physics):
                 self.rhs_terms['prod'] = self.io.budget['TKE_shear_production_wake'][xid,yid,zid] * nonDim
             else:
                 self.rhs_terms['prod'] = np.zeros(np.shape(self.io.budget['TKE_shear_production_wake'][xid,yid,zid]))
+
+            print(np.mean(self.rhs_terms['prod']))
 
             if self.LES_buoy:
                 self.rhs_terms['buoy'] = self.io.budget['TKE_buoyancy_wake'][xid,yid,zid] * nonDim
@@ -397,12 +400,24 @@ class WakeTKE(Physics):
             self.f = self.io.budget['TKE_wake'][xid,yid,zid]/self.Uref**2
 
             self.u = (self.base_io.budget['ubar'] + self.io.budget['delta_u'])[xid,yid,zid]/self.Uref
+            self.du = self.io.budget['delta_u'][xid,yid,zid]/self.Uref
+            self.ub = self.base_io.budget['ubar'][xid,yid,zid]/self.Uref
             if self.LES_delta_v_delta_w_adv:
                 self.v = (self.base_io.budget['vbar'] + self.io.budget['delta_v'])[xid,yid,zid]/self.Uref
                 self.w = (self.base_io.budget['wbar'] + self.io.budget['delta_w'])[xid,yid,zid]/self.Uref
+
+                self.dv = self.io.budget['delta_v'][xid,yid,zid]/self.Uref
+                self.vb = self.base_io.budget['vbar'][xid,yid,zid]/self.Uref
+                self.dw = self.io.budget['delta_w'][xid,yid,zid]/self.Uref
+                self.wb = self.base_io.budget['wbar'][xid,yid,zid]/self.Uref
             else:
                 self.v = (self.base_io.budget['vbar'])[xid,yid,zid]/self.Uref
                 self.w = (self.base_io.budget['wbar'])[xid,yid,zid]/self.Uref
+
+                self.dv = np.zeros(np.shape(self.io.budget['delta_v'][xid,yid,zid]))
+                self.vb = self.base_io.budget['vbar'][xid,yid,zid]/self.Uref
+                self.dw = np.zeros(np.shape(self.io.budget['delta_v'][xid,yid,zid]))
+                self.wb = self.base_io.budget['wbar'][xid,yid,zid]/self.Uref
 
             # #TEST
             # self.dfdz = np.gradient(self.f, self.dz, axis=2)
