@@ -31,27 +31,30 @@ class wake_width_MLModel(MixingLengthModel):
     """   
     def __init__(self, 
                  ti_h: float = 1,
-                 type: str = "ambient"):
+                 type: str = "ambient", 
+                 ub_val: float = 1):
 
         self.ti_h = ti_h
         self.type = type
+        self.ub_val = ub_val
 
         self.ell_arr = []
         
 
-    def calculate_ell(self, du, z, y, **kwargs):
+    def calculate_ell(self, du, z, y, xid, **kwargs):
+
+        zh = np.argmin(np.abs(z))
 
         if self.type == 'ambient':
-            [ind1, ind2] = compute_ambient_width(du, frac=-0.05)
-            print(ind1, ind2)
+            [ind1, ind2] = compute_ambient_width(du[:,zh], val=-0.05*self.ub_val[xid])
             ell = y[ind2] - y[ind1]
 
             if ell == 0:
-                ell = 0.08
+                ell_c = 0.08
             else:
-                ell = 0.75 * self.ti_h * ell
+                ell_c = ell
 
-        self.ell = ell
+        self.ell = ell_c
 
         self.ell_arr.append(ell)
 
