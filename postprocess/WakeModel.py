@@ -55,6 +55,11 @@ class WakeModel():
             x, du = self.delta_u_int.integrate(T=[self.delta_u.x[0], self.delta_u.x[-1]])
 
             self.du = du
+        elif not self.turbulence_model.integrate:
+            self.delta_u.nuT = self.turbulence_model.nuT
+            x, du = self.delta_u_int.integrate(T=[self.delta_u.x[0], self.delta_u.x[-1]])
+
+            self.du = du
         else:
             # step 1 get nuT IC
             self.turbulence_model.get_ic(self.turbulence_model.x[0])
