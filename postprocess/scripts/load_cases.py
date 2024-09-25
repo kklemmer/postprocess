@@ -4,7 +4,21 @@ import numpy as np
 
 import seaborn as sns
 
-def load_cases_z0_dTdt(dTdt=[0, -0.25, -0.5, -0.75, -1], z0=[1, 10, 50]):
+from coriolis import scripts
+from coriolis.streamtube import Streamtube
+from coriolis.budget import Budget
+
+
+def streamtube(case, method='stream3', R=0.5, tidx=86000): 
+    # case.read_budgets(budget_terms=['ubar', 'vbar', 'wbar'], tidx=tidx)
+    stream = Streamtube(case.xLine, case.yLine, case.zLine, 
+                        case.budget['ubar'], case.budget['vbar'], case.budget['wbar'],  
+                        method=method)
+    stream.compute_mask(R=R)
+    case.stream_mask = stream.mask
+
+
+def load_cases_z0_dTdt(dTdt=[0, -0.25, -0.5, -0.75, -1], z0=[1, 10, 50], streamtube=False):
     """
     Load the budgets for the stability and z0 sweeps into a polars dataframe
 
@@ -62,16 +76,22 @@ def load_cases_z0_dTdt(dTdt=[0, -0.25, -0.5, -0.75, -1], z0=[1, 10, 50]):
                 cases[i,j]['u_hh'] = np.mean(np.sqrt(cases[i,j]['base'].budget['ubar'][...,14]**2 \
                                                     + cases[i,j]['base'].budget['vbar'][...,14]**2))
                 
-    budget_terms_to_read = ['delta_u', 'delta_v', 'delta_w', 'xAdv_delta_base_mean',
-                        'xAdv_delta_base_fluc', 'xAdv_delta_delta_mean', 
-                        'xAdv_delta_delta_fluc', 'xAdv_base_delta_fluc', 'xAdv_base_delta_mean',
-                        'xCor', 'xSGS', 'dpdx', 'xAD']
-    for i in range(len(dTdt)):
+    budget_terms_to_read = ['delta_u', 'delta_v', 'delta_w']#, 'xAdv_delta_base_mean',
+                        # 'xAdv_delta_base_fluc', 'xAdv_delta_delta_mean', 
+                        # 'xAdv_delta_delta_fluc', 'xAdv_base_delta_fluc', 'xAdv_base_delta_mean',
+                        # 'xCor', 'xSGS', 'dpdx', 'xAD']
+    for i,dT in enumerate(dTdt):
         for j in range(len(z0)):
             cases[i,j]['base'].read_budgets(budget_terms=['ubar', 'vbar', 'wbar'])
             cases[i,j]['deficit'].read_budgets(budget_terms=budget_terms_to_read)
             # cases[i,j]['deficit_budget'].grad_calc(Lref=cases[i,j]['Lref'])
             cases[i,j]['prim'].read_budgets(budget_terms=['ubar', 'vbar', 'wbar'])
+
+            if streamtube:
+                if dT == 0:
+                    streamtube(cases[i,j]['prim'])
+                else:
+                    streamtube(cases[i,j]['prim'], method='integrator')
     
     cases = list(np.reshape(cases, (len(dTdt) * len(z0),)))
 
