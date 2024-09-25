@@ -8,9 +8,10 @@ import numpy as np
 from typing import Optional
 from scipy import ndimage
 from padeopsIO import budget_utils
-from postprocess.utils import finite_diff
+from postprocess.utils import finite_diff, wall_bc, top_bc
 from postprocess.Physics import Physics
 from postprocess.Physics import WakeTKE
+from postprocess import MixingLengthModel
 
 from scipy.stats import linregress
 
@@ -154,6 +155,7 @@ class kl_LES_TurbulenceModel(TurbulenceModel):
             self.ell = ell[self.xid, np.newaxis, np.newaxis]
 
         self.calculate_nuT()
+        self.integrate = False
 
     def calculate_nuT(self):
         if "TKE_wake" not in self.io.budget:
@@ -222,6 +224,8 @@ class kl_exact_TurbulenceModel(WakeTKE, TurbulenceModel):
         self.nuT = np.zeros(np.shape(self.f))
         self.nuT[0,...] = self.nuT_exact[0,...]
 
+        self.integrate = False
+
 class kl_TurbulenceModel(WakeTKE, kl_LES_TurbulenceModel):
     """
     k-l turbulence model
@@ -246,7 +250,14 @@ class kl_TurbulenceModel(WakeTKE, kl_LES_TurbulenceModel):
                  dz: float = 0.1,
                  Uref: float = 1.,
                  Lref: float = 1., 
-                 ell = 0.16 * 0.5):
+                 ell_model_str: str = "",
+                 ell_LES: bool = True,
+                 c_trans: float = 1.,
+                 c_diss: float = 1.,
+                 c_nu: float = 1.,
+                 ml_type: str = "ambient",
+                 model_ic: bool = False,
+                 x0_nw: float = 0):
         """
         Calls the constructor of Physics
         """
@@ -278,109 +289,175 @@ class kl_TurbulenceModel(WakeTKE, kl_LES_TurbulenceModel):
         self.LES_sgs_trans = LES_sgs_trans
         self.LES_delta_v_delta_w_adv = LES_delta_v_delta_w_adv
 
+        self.c_trans = c_trans
+        self.c_diss = c_diss
+    
+        self.x0_nw = x0_nw
+
         super().__init__(io=io, padeops=padeops, LES_prod=LES_prod, LES_buoy=LES_buoy, LES_diss=LES_diss, LES_turb_trans=LES_turb_trans,
                  LES_pres_trans=LES_pres_trans, LES_sgs_trans=LES_sgs_trans, LES_delta_v_delta_w_adv=LES_delta_v_delta_w_adv,
-                 base_io=base_io, prim_io=prim_io, xlim=xlim, ylim=ylim, zlim=zlim, dx=dx, dy=dy, dz=dz, Uref=Uref, Lref=Lref) 
+                 base_io=base_io, prim_io=prim_io, xlim=xlim, ylim=ylim, zlim=zlim, dx=dx, dy=dy, dz=dz, Uref=Uref, Lref=Lref, model_ic=model_ic) 
 
-        if isinstance(ell, float):
-            self.ell = ell * np.ones(np.shape(self.f))
+        # initialize mixing length array
+        self.ell = np.zeros([self.nx, self.ny, self.nz])
+        self.c_nu = c_nu
+
+        if "TKE_wake" not in self.io.budget:
+            if "TKE" not in self.base_io.budget:
+                self.base_io.read_budgets(['uu', 'vv', 'ww'])
+                self.base_io.budget['TKE'] = 0.5 * (self.base_io.budget['uu'] + self.base_io.budget['vv'] + self.base_io.budget['ww'])
+            if "TKE" not in self.prim_io.budget:
+                self.prim_io.read_budgets(['uu', 'vv', 'ww'])
+                self.prim_io.budget['TKE'] = 0.5 * (self.prim_io.budget['uu'] + self.prim_io.budget['vv'] + self.prim_io.budget['ww'])
+
+            self.io.budget['TKE_wake'] = self.prim_io.budget['TKE'] - self.base_io.budget['TKE']
+
+        self.tke = self.io.budget['TKE_wake'][self.xid, self.yid, self.zid] / self.Uref**2
+        self.base_tke = self.base_io.budget['TKE'][self.xid, self.yid, self.zid] / self.Uref**2
+
+
+        # initialize mixing length model
+        if ell_model_str == "wake_width":
+            zh = np.argmin(np.abs(self.z))
+            self.ell_model = MixingLengthModel.wake_width_MLModel(ti_h=np.mean((np.sqrt(self.base_tke)/self.ub)[...,np.argmin(np.abs(self.z))], axis=(0,1)), 
+                                                                  type=ml_type, ub_val = np.mean(self.base_io.budget['ubar'][...,zh], axis=1)/self.Uref)
+            self.ell_model.calculate_ell(du=self.du[0,...], z=self.z, y=self.y, xid=0)
+            self.ell[0,:,:] = self.ell_model.ell * np.ones([self.ny, self.nz])
         else:
-            self.ell = ell[self.xid, np.newaxis, np.newaxis]
+            self.ell_model = MixingLengthModel.constant_MLModel()
+            self.ell_model.calculate_ell()
+            self.ell = self.ell_model.ell * np.ones([self.nx, self.ny, self.nz])
 
         self.calculate_nuT()
 
-    def calculate_nuT(self, x=None, k=None, return_nuT=False):
+        self.nuT[0,...] = self.nuT[0,...] * 0.5
+
+        self.integrate = True
+
+    def calculate_nuT(self, x=None, k=None, du=None, return_nuT=False):
         if k is None:
-            if "TKE_wake" not in self.io.budget:
-                if "TKE" not in self.base_io.budget:
-                    self.base_io.read_budgets(['uu', 'vv', 'ww'])
-                    self.base_io.budget['TKE'] = 0.5 * (self.base_io.budget['uu'] + self.base_io.budget['vv'] + self.base_io.budget['ww'])
-                if "TKE" not in self.prim_io.budget:
-                    self.prim_io.read_budgets(['uu', 'vv', 'ww'])
-                    self.prim_io.budget['TKE'] = 0.5 * (self.prim_io.budget['uu'] + self.prim_io.budget['vv'] + self.prim_io.budget['ww'])
-
-                self.io.budget['TKE_wake'] = self.prim_io.budget['TKE'] - self.base_io.budget['TKE']
-
-            self.tke = self.io.budget['TKE_wake'][self.xid, self.yid, self.zid] / self.Uref**2
-            self.base_tke = self.base_io.budget['TKE'][self.xid, self.yid, self.zid] / self.Uref**2
-
-            self.nuT = np.sqrt(self.tke + self.base_tke) * self.ell
+            self.nuT = self.c_nu * np.sqrt(self.tke + self.base_tke) * self.ell
         else:
             xloc = np.argmin(np.abs(self.x - x))
-            tke = k + self.base_tke[xloc,...]
-            tke[tke < 0] = 0
-            nuT = np.sqrt(tke) * self.ell[xloc,...]
-            # nuT[nuT == np.nan] = 0
-            if return_nuT:
-                return nuT
+
+            if x <= self.x0_nw:
+                self.ell_model.calculate_ell(du=du, z=self.z, y=self.y, xid=xloc)
+
+                # if np.abs(self.ell_model.ell - ell_old)/ell_old > 0.05 :
+                #     self.ell_model.ell = ell_old
+
+                self.ell[xloc,:,:] = self.ell_model.ell * np.ones([self.ny, self.nz])       
+
+
+                nuT = self.c_nu * np.sqrt(self.base_tke[xloc,...]) * self.ell[xloc,...] * 0.5
+
+                if return_nuT:
+                    
+                    return nuT
+                else:
+                    self.nuT[xloc,...] = nuT
+
+                return
             else:
-                self.nuT[xloc,...] = nuT
+                if du is not None:
+                    ell_old = self.ell_model.ell
+                    self.ell_model.calculate_ell(du=du, z=self.z, y=self.y, xid=xloc)
+
+                    # if np.abs(self.ell_model.ell - ell_old)/ell_old > 0.05 :
+                    #     self.ell_model.ell = ell_old
+
+                    self.ell[xloc,:,:] = self.ell_model.ell * np.ones([self.ny, self.nz])       
+
+                tke = k + self.base_tke[xloc,...]
+                tke[tke < 0] = 0
+
+                nuT = self.c_nu * np.sqrt(tke) * self.ell[xloc,...]
+                # nuT[nuT == np.nan] = 0
+                if return_nuT:
+                    return nuT
+                else:
+                    self.nuT[xloc,...] = nuT
 
 
 
-    def dfdx(self, x, f, u=None, nuT=None): 
+    def dfdx(self, x, f, du=None, nuT=None): 
             """du/dt function"""
 
             xid = np.argmin(np.abs(self.x - x))
 
-            if u is None:
+            if du is None:
                 u = self.u[xid,...]
+                du = self.du[xid,...]
             else:
-                u = u + self.ub[xid,...]
+                u = du + self.ub[xid,...]
             if nuT is None:
                 self.calculate_nuT()
                 nuT = self.nuT[xid,...]
 
             dfdy = finite_diff(f.T, self.dy).T
-            dfdz = finite_diff(f, self.dz)
+            
+            # wall BC
+            f_new = top_bc(wall_bc(f))
+            dfdz = finite_diff(f_new, self.dz)[...,1:-1]
 
-            ddudy = finite_diff(self.du[xid,...].T, self.dy).T
-            ddudz = finite_diff(self.du[xid,...], self.dz)
+
+            ddudy = finite_diff(du.T, self.dy).T
+
+            # wall BC
+            du_new = wall_bc(du)
+            ddudz = finite_diff(du_new, self.dz)[...,:-1]
 
             dubdy = finite_diff(self.ub[xid,...].T, self.dy).T
-            dubdz = finite_diff(self.ub[xid,...], self.dz)
 
-            dudy = finite_diff((self.ub + self.du)[xid,...].T, self.dy).T
-            dudz = finite_diff((self.ub + self.du)[xid,...], self.dz)
-
-            ddvdy = finite_diff(self.dv[xid,...].T, self.dy).T
-            ddvdz = finite_diff(self.dv[xid,...], self.dz)
-
-            dvbdy = finite_diff(self.vb[xid,...].T, self.dy).T
-            dvbdz = finite_diff(self.vb[xid,...], self.dz)
-
-            ddwdy = finite_diff(self.dw[xid,...].T, self.dy).T
-            ddwdz = finite_diff(self.dw[xid,...], self.dz)
-
-            dwbdy = finite_diff(self.wb[xid,...].T, self.dy).T
-            dwbdz = finite_diff(self.wb[xid,...], self.dz)
+            # wall BC
+            ub_new = wall_bc(self.ub[xid,...])
+            dubdz = finite_diff(ub_new, self.dz)[...,:-1]
+            
+            dudy = ddudy + dubdy
+            dudz = ddudz + dubdz
 
             rhs = 0
             # add terms from LES (if any)
             for key, val in self.rhs_terms.items():
                 rhs += val[xid,...]
 
-            # # production
-            base_tke = self.base_tke[xid,...]
-            base_tke[base_tke < 0] = 0
-            lm = 0.4 * self.z / (1. + 0.4 * self.z / 0.214)
-            nuT_base = np.sqrt(base_tke)/lm[np.newaxis,:]
-            self.nuT_base = nuT_base
-           
-            rhs += self.prod_bool * (nuT * (dudy**2 + dudz**2) )
+            # # production           
+            rhs += self.prod_bool * (nuT * (ddudy*dudy + ddudz*dudz)) #+ 2*(ddvdy + 2*dvbdy)*ddvdy + 2*(ddwdz + 2*dwbdz)*ddwdz\
+                                    #  + (ddvdz + 2*dvbdz)*ddvdz + 2 * (ddvdz + 2*dvbdz)*ddwdy + (ddwdy + 2*dwbdy)*ddwdy)
 
             # self.rhs_terms['prod'][xid,...] = self.prod_bool * (np.sqrt(self.base_tke)/self.ub)[xid,...] * (nuT * (ddudy**2 + ddudz**2 + ddvdy**2 + ddwdz**2 \
             #                                + ddudy * dubdy + ddudz * dubdz + ddvdy * dvbdy + ddwdz * dwbdz))
             # turbulent transport
-            rhs += self.trans_bool * (finite_diff((nuT * dfdy).T, self.dy).T \
+            rhs += self.trans_bool * self.c_trans * (finite_diff((nuT * dfdy).T, self.dy).T \
                     + finite_diff(nuT * dfdz, self.dz))
             
             # # dissipation
             tke = f #+ self.base_tke[xid,...]
             tke[tke < 0] = 0
-            diss = - self.diss_bool * tke**(3/2) /self.ell[xid,...]
+            diss = - self.diss_bool * self.c_diss * tke**(3/2) /self.ell[xid,...]
             diss[self.diss_bool == 0] = 0
             rhs += diss
+
+            # turbine sink term
+            if x == 0:
+                ct = 0.75
+                a = 0.25
+                ctp = ct/(1-a)**2
+
+                xG, yG, zG = np.meshgrid(self.x, self.y, self.z, indexing='ij')  # creates 3D meshgrid
+                xT, yT, zT = (0, 0, 0)  # coordinates of turbine
+                R = 0.5
+                kernel = ((yG - yT)**2 + (zG - zT)**2 < R**2)
+                kernel_normalized = kernel / np.sum(kernel)
+
+                kd = np.sum(np.mean(self.base_tke, axis=0) * kernel_normalized)
+                ud = np.sum(np.mean(self.ub, axis=0) * kernel_normalized)
+
+                Sk = - 0.5 * ctp * np.pi/4 * (4/3 * kd * ud * (2/3 * kd)**(3/2))
+
+
+
+                rhs += Sk * kernel_normalized[xid,...]
 
             return (rhs - self.v[xid,...] * dfdy - self.w[xid,...] * dfdz)/u
 
@@ -449,10 +526,46 @@ class scott_data_TurbulenceModel(TurbulenceModel):
         slopes, slope_err = calculate_slope(x_data, y_data)
 
         self.nuT = self.Cz * slopes / self.Uref
+        self.nuT[self.nuT < 0] = np.min(self.nuT)
         self.nuT_err = self.Cz * slope_err / self.Uref
 
         return
 
+class scott_model_TurbulenceModel(TurbulenceModel):
+    """
+    Eddy viscosity based on the data-driven turbulence 
+    modeling procedure outlined in Scott et al. 2023
+    """
+
+    def __init__(self, io,
+                 padeops: bool = True, 
+                 base_io: Optional[object] = None,
+                 prim_io: Optional[object] = None,               
+                 xlim: Optional[list] = None,
+                 ylim: Optional[list] = None,
+                 zlim: Optional[list] = None,
+                 dx: float = 0.1,
+                 dy: float = 0.1,
+                 dz: float = 0.1,
+                 Uref: float = 1.,
+                 Lref: float = 1.):
+        
+        super().__init__(io, padeops, base_io, prim_io, xlim, ylim, zlim, dx, dy, dz, Uref, Lref) 
+
+        self.calculate_nuT()
+        self.integrate = False
+
+    def calculate_nuT(self):
+        """
+        Calculate the 1D nuT following the model in Scott et al 2023
+        """
+        Ub = np.mean(self.base_io.budget['ubar'][...,14])/self.Uref
+        Ct = 0.75
+        A = 0.5 * Ub * np.sqrt(1-Ct)/2
+        sigma = 5.5
+
+        self.nuT = np.broadcast_to(A*(0.01 + np.multiply(self.x/sigma**2, np.exp(-self.x**2/(2*sigma**2))))[:,np.newaxis, np.newaxis], (self.nx, self.ny, self.nz))
+        return
 
 class scott_data_nonlinear_TurbulenceModel():
     """
@@ -604,6 +717,40 @@ class scott_data_nuT_y_TurbulenceModel(scott_data_TurbulenceModel):
         self.nuT_y_err = self.Cy * slope_err / self.Uref
 
         return
+
+class blackadar_TurbulenceModel(TurbulenceModel):
+    """
+    Eddy viscosity from Blackadar 1962
+    """
+
+    def __init__(self, io,
+                padeops: bool=False, 
+                base_io: Optional[object] = None,
+                prim_io: Optional[object] = None, 
+                xlim: Optional[list] = None,
+                ylim: Optional[list] = None,
+                zlim: Optional[list] = None,
+                dx: float = 0.1,
+                dy: float = 0.1,
+                dz: float = 0.1,
+                Uref: float = 1.,
+                Lref: float = 1.,
+                fc: float = 27):
+
+        super().__init__(io, padeops, base_io, prim_io, xlim, ylim, zlim, dx, dy, dz, Uref, Lref)
+        self.fc = fc / self.Lref
+
+        self.calculate_nuT()
+        self.integrate = False
+
+    def calculate_nuT(self):
+        z = self.base_io.zLine[self.zid] # ensures the correct mixing length where 0 is at the wall
+        kappa = 0.4
+        lam = 27 / 126
+        ell = kappa * z/(1 + kappa * z/lam)
+
+        self.nuT = 0.01 + np.broadcast_to((4*ell**2 * (1/self.Uref) * np.abs(np.mean(np.gradient(self.base_io.budget['ubar'][self.xid,self.yid,self.zid], 
+                                                                         self.dz, axis=2), axis=(0,1))))[np.newaxis, np.newaxis,:], (self.nx, self.ny, self.nz))
 
 def calculate_slope(x_data, y_data):
 

@@ -6,9 +6,10 @@ June 2024
 """
 import numpy as np
 from typing import Optional
-from postprocess.utils import finite_diff
+from postprocess.utils import finite_diff, wall_bc, top_bc
 from padeopsIO import budget_utils
-from postprocess import TurbulenceModel
+from scipy.signal import convolve2d
+
 
 class Physics():
 
@@ -62,6 +63,10 @@ class Physics():
             self.yid = yid
             self.zid = zid
 
+            self.nx = len(self.x)
+            self.ny = len(self.y)
+            self.nz = len(self.z)
+
         else:
             self.x = np.arange(np.min(self.xlim), np.max(self.xlim) + self.dx, self.dx)
             self.y = np.arange(np.min(self.ylim), np.max(self.ylim) + self.dy, self.dy)
@@ -94,7 +99,6 @@ class Physics():
 
             rhs = 0
             for key, val in self.rhs_terms.items():
-                # print(key)
                 rhs += val[xid,...]
 
             return (rhs - self.v[xid,...] * dfdy - self.w[xid,...] * dfdz)/u
@@ -124,7 +128,10 @@ class WakeDeficitX(Physics):
                  dy: float = 0.1,
                  dz: float = 0.1,
                  Uref: float = 1.,
-                 Lref: float = 1.):
+                 Lref: float = 1., 
+                 model_ic: bool = False,
+                 veer_correction: bool = False,
+                 dv_dw_streamtube: bool = False):
         """
         Calls the constructor of Physics
         """
@@ -139,9 +146,14 @@ class WakeDeficitX(Physics):
         self.LES_xturb_x = LES_xturb_x
         self.LES_xturb_y = LES_xturb_y
         self.LES_xturb_z = LES_xturb_z
-  
+        self.model_ic = model_ic
+
+        self.d = 1
 
         self.turbulence_model = turbulence_model
+
+        self.veer_correction = veer_correction
+        self.dv_dw_streamtube = dv_dw_streamtube
 
         super().__init__(io, padeops, xlim, ylim, zlim, dx, dy, dz, Uref, Lref)         
 
@@ -231,13 +243,119 @@ class WakeDeficitX(Physics):
 
             self.f = self.io.budget['delta_u'][xid,yid,zid]/self.Uref
 
-            self.u = (self.base_io.budget['ubar'])[xid,yid,zid]/self.Uref
+            self.u = self.base_io.budget['ubar'][xid,yid,zid]/self.Uref
+            self.du = self.io.budget['delta_u'][xid,yid,zid]/self.Uref
+            self.ub = self.base_io.budget['ubar'][xid,yid,zid]/self.Uref
             if self.LES_delta_v_delta_w_adv:
                 self.v = (self.base_io.budget['vbar'] + self.io.budget['delta_v'])[xid,yid,zid]/self.Uref
                 self.w = (self.base_io.budget['wbar'] + self.io.budget['delta_w'])[xid,yid,zid]/self.Uref
+
+                self.dv = self.io.budget['delta_v'][xid,yid,zid]/self.Uref
+                self.vb = self.base_io.budget['vbar'][xid,yid,zid]/self.Uref
+                self.dw = self.io.budget['delta_w'][xid,yid,zid]/self.Uref
+                self.wb = self.base_io.budget['wbar'][xid,yid,zid]/self.Uref
+
+                if self.dv_dw_streamtube:
+                    dv = np.sum(self.io.budget['delta_v'][xid,yid,zid]/self.Uref * self.prim_io.stream_mask[xid,yid,zid], axis=(1,2)) \
+                                / np.sum(self.prim_io.stream_mask[xid,yid,zid], axis=(1,2))
+                    self.dv = np.broadcast_to(dv[:,np.newaxis,np.newaxis], (self.nx, self.ny, self.nz))
+
+                    dw = np.sum(self.io.budget['delta_w'][xid,yid,zid]/self.Uref * self.prim_io.stream_mask[xid,yid,zid], axis=(1,2)) \
+                                / np.sum(self.prim_io.stream_mask[xid,yid,zid], axis=(1,2)) 
+                    self.dw = np.broadcast_to(dw[:,np.newaxis,np.newaxis], (self.nx, self.ny, self.nz))
+
+                    self.v = (self.base_io.budget['vbar'])[xid,yid,zid]/self.Uref + self.dv
+                    self.w = (self.base_io.budget['wbar'])[xid,yid,zid]/self.Uref + self.dw
             else:
                 self.v = (self.base_io.budget['vbar'])[xid,yid,zid]/self.Uref
                 self.w = (self.base_io.budget['wbar'])[xid,yid,zid]/self.Uref
+
+                self.dv = np.zeros(np.shape(self.io.budget['delta_v'][xid,yid,zid]))
+                self.vb = self.base_io.budget['vbar'][xid,yid,zid]/self.Uref
+                self.dw = np.zeros(np.shape(self.io.budget['delta_v'][xid,yid,zid]))
+                self.wb = self.base_io.budget['wbar'][xid,yid,zid]/self.Uref
+
+                if self.veer_correction:
+                    zh = np.argmin(np.abs(self.z))
+                    z_top = np.argmin(np.abs(self.z-0.5))
+                    z_bot = np.argmin(np.abs(self.z+0.5))
+                    self.N = z_top - z_bot + 1
+
+                    wd_top = np.rad2deg(np.arctan(np.mean(self.vb[...,z_top]/self.ub[...,z_top])))
+                    wd_bot = np.rad2deg(np.arctan(np.mean(self.vb[...,z_bot]/self.ub[...,z_bot])))
+
+                    self.yaw = np.abs(wd_top - wd_bot)
+                    self.yaw = 5
+
+                    self._compute_vw()
+
+                    self.v = self.vb + self.dv
+                    self.w = self.wb + self.dw
+
+
+
+    def get_ic(self, x0, smooth_fact=1.5):
+        """
+        Returns the initial condition from the x0 location
+        """
+        if not self.model_ic:
+            # get initial condition from data
+            xid = np.argmin(np.abs(self.x - x0))
+            self.f0 = self.f[xid,...]
+        else:
+            """
+            Initial condition for the wake model
+
+            Args: 
+                self (CurledWake)
+                y (np.array): lateral axis
+                z (np.array): vertical axis
+                ud (float): disk velocity
+                smooth_fact (float): Gaussian convolution standard deviation, 
+                    equal to smooth_fact * self.dy. Defaults to 1.5. 
+            """
+            ### TODO get rid of hard coded values
+            ct = 0.75
+            yaw = 0
+            yG, zG = np.meshgrid(self.y, self.z, indexing='ij')
+            kernel_y = np.arange(-10, 11)[:, None] * self.dy
+            kernel_z = np.arange(-10, 11)[None, :] * self.dz
+
+            turb = (yG**2 + zG**2) < (0.5)**2
+            # gauss = np.exp(-(yG**2 + zG**2) / (np.sqrt(self.dy * self.dz) * smooth_fact)**2 / 2)
+            gauss = np.exp(-(kernel_y**2 + kernel_z**2) / (np.sqrt(self.dy * self.dz) * smooth_fact)**2 / 2)
+            gauss /= np.sum(gauss)
+            a = 0.5 * (1 - np.sqrt(1 - ct * np.cos(yaw)**2))
+            delta_u = -2 * a * self.get_ud()
+
+            self.f0 = convolve2d(turb, gauss, 'same') * delta_u
+    
+    def get_ud(self, weighting='disk')-> float: 
+        """
+        Gets background disk velocity by numerically integrating self.U
+        """
+        if self.ub.ndim == 1: 
+            r = 0.5
+            zids = abs(self.zg) < r  # within the rotor area
+            if weighting == 'disk': 
+                # weight based on the area of the "disk"
+                A = np.trapz(np.sqrt(r**2 - self.z[zids]**2)) 
+                return np.trapz(self.ub[zids] * np.sqrt(r**2 - self.z[zids]**2)) / A
+            
+            elif weighting == 'equal': 
+                return np.mean(self.ub[zids])
+            elif weighting == 'hub': 
+                return np.interp(0, self.z, self.ub)  # hub height velocity
+            else: 
+                raise NotImplementedError('get_ud(): `weighting` must be "disk", "equal", or "hub". ')
+        else: 
+            xG, yG, zG = np.meshgrid(self.x, self.y, self.z, indexing='ij')  # creates 3D meshgrid
+            xT, yT, zT = (0, 0, 0)  # coordinates of turbine
+            R = 0.5
+            kernel = ((yG - yT)**2 + (zG - zT)**2 < R**2)
+            kernel_normalized = kernel / np.sum(kernel)
+
+            return np.sum(np.mean(self.ub, axis=0) * kernel_normalized)
 
     def dfdx(self, x, f, nuT=None): 
             """du/dt function for delta u"""
@@ -245,9 +363,13 @@ class WakeDeficitX(Physics):
             u = self.u[xid,...] + f
 
             dfdy = finite_diff(f.T, self.dy).T
-            dfdz = finite_diff(f, self.dz)
 
-            if nuT is None:
+            # wall BC
+            f_new = top_bc(wall_bc(f))
+            dfdz = finite_diff(f_new, self.dz)[...,1:-1]
+
+
+            if nuT is None and self.turbulence_model is not None:
                 nuT = self.nuT[xid,...]
 
             rhs = 0
@@ -281,6 +403,52 @@ class WakeDeficitX(Physics):
             # dfdz = self.dfdz[xid,...]
             # dfdy = self.dfdy[xid,...]
             return (rhs - self.v[xid,...] * dfdy - self.w[xid,...] * dfdz)/u
+    
+    def _compute_vw(self)-> None: 
+        """
+        Use Lamb-Oseen vortices to compute curling
+        """
+        if self.LES_delta_v_delta_w_adv:
+            return
+        if self.yaw == 0: 
+            return
+
+        ct = 0.75 #TODO this is hardcoded
+        sigma = 0.2
+        u_inf = self.get_ud('hub')
+        r_i = np.linspace(-(self.d - self.dz) / 2, (self.d - self.dz) / 2, self.N) 
+
+        print(u_inf)
+
+        Gamma_0 = 0.5 * self.d * u_inf * ct * np.sin(self.yaw) * np.cos(self.yaw)**2
+        Gamma_i = Gamma_0 * 4 * r_i / (0.5 * np.sqrt(0.5**2 - (r_i / self.d)**2))
+
+        # generally, vortices can decay. So sigma should be a vector
+        sigma = sigma * self.d * np.ones_like(self.x) 
+        
+        # now we build the main summation, which is 4D (x, y, z, i)
+        # yg_total = np.arange(self.y[0]-self.y[-1], self.y[-1]+self.dy, self.dy)
+        # zg_total = np.arange(self.z[0]-self.z[-1], self.z[-1]+self.dz, self.dz)
+        # yG, zG = np.meshgrid(yg_total, zg_total, indexing='ij')
+        yG, zG = np.meshgrid(self.y, self.z, indexing='ij')
+        yG = yG[None, ..., None]
+        zG = zG[None, ..., None]
+        r4D = yG**2 + (zG - r_i[None, None, None, :])**2  # 4D grid variable
+
+        # mask for the ground effect
+        # ind_y = np.argmin(np.abs(yg_total - self.yg[0]))
+        # ind_z = np.argmin(np.abs(zg_total - self.zg[0]))
+        # mask = np.ones(np.shape(r4D))
+        # mask[:,:,:ind_y,:ind_z] = -1
+
+        # put pieces together: 
+        exponent = 1 - np.exp(-r4D / sigma[..., None, None, None]**2)
+        summation = exponent / (2 * np.pi * r4D) * Gamma_i[None, None, None, :]
+
+        v = np.sum(summation * (zG - r_i[None, None, None, :]), axis=-1)  # sum all vortices
+        w = np.sum(summation * -yG, axis=-1)
+        self.dv = -v * (self.x >= 0)[:, None, None]
+        self.dw = -w * (self.x >= 0)[:, None, None]
 
 
 class WakeTKE(Physics):
@@ -306,7 +474,8 @@ class WakeTKE(Physics):
                  dy: float = 0.1,
                  dz: float = 0.1,
                  Uref: float = 1.,
-                 Lref: float = 1.):
+                 Lref: float = 1.,
+                 model_ic: bool = False):
         """
         Calls the constructor of Physics
         """
@@ -319,8 +488,19 @@ class WakeTKE(Physics):
         self.LES_delta_v_delta_w_adv = LES_delta_v_delta_w_adv
         self.base_io = base_io
         self.prim_io = prim_io
+        self.model_ic = model_ic
 
         super().__init__(io, padeops, xlim, ylim, zlim, dx, dy, dz, Uref, Lref)         
+
+    def get_ic(self, x0):
+        """
+        Returns the initial condition from the x0 location
+        """
+        if not self.model_ic:
+            xid = np.argmin(np.abs(self.x - x0))
+            self.f0 = self.f[xid,...]
+        else:
+            self.f0 = np.zeros(np.shape(self.f[0,...]))
 
     def create_terms_dict(self):
         """
@@ -358,8 +538,6 @@ class WakeTKE(Physics):
                 self.rhs_terms['prod'] = self.io.budget['TKE_shear_production_wake'][xid,yid,zid] * nonDim
             else:
                 self.rhs_terms['prod'] = np.zeros(np.shape(self.io.budget['TKE_shear_production_wake'][xid,yid,zid]))
-
-            print(np.mean(self.rhs_terms['prod']))
 
             if self.LES_buoy:
                 self.rhs_terms['buoy'] = self.io.budget['TKE_buoyancy_wake'][xid,yid,zid] * nonDim
