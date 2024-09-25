@@ -254,7 +254,6 @@ class Integration():
         t_n = T[0]
         nuTt.append(self.turbulence_model.nuT[0,...])
         
-        print(np.shape(k_n))
         i=0
         while True: 
             ut.append(u_n)
@@ -266,25 +265,25 @@ class Integration():
             if t_n1 > T[1] + dt/2:  # add some buffer here
                 break
             # nuT = self.turbulence_model.nuT[i,...]
-            nuT = self.turbulence_model.calculate_nuT(x=t_n, k=k_n, return_nuT=True)
+            nuT = self.turbulence_model.calculate_nuT(x=t_n, k=k_n, du=u_n, return_nuT=True)
             # self.physics.nuT = self.turbulence_model.nuT
             uk1 = dt * dudx(t_n, u_n, nuT=nuT)
-            kk1 = dt * dkdx(t_n, k_n, u=u_n, nuT=nuT)
+            kk1 = dt * dkdx(t_n, k_n, du=u_n, nuT=nuT)
 
-            nuT = self.turbulence_model.calculate_nuT(x=t_n + dt/2, k=k_n + kk1/2, return_nuT=True)
+            nuT = self.turbulence_model.calculate_nuT(x=t_n + dt/2, k=k_n + kk1/2, du=u_n + uk1/2, return_nuT=True)
             
             uk2 = dt * dudx(t_n + dt/2, u_n + uk1/2, nuT=nuT)
-            kk2 = dt * dkdx(t_n + dt/2, k_n + kk1/2, u=u_n + uk1/2, nuT=nuT)
+            kk2 = dt * dkdx(t_n + dt/2, k_n + kk1/2, du=u_n + uk1/2, nuT=nuT)
 
-            nuT = self.turbulence_model.calculate_nuT(x=t_n + dt/2, k=k_n + kk2/2, return_nuT=True)
+            nuT = self.turbulence_model.calculate_nuT(x=t_n + dt/2, k=k_n + kk2/2, du=u_n + uk2/2, return_nuT=True)
             
             uk3 = dt * dudx(t_n + dt/2, u_n + uk2/2, nuT=nuT)
-            kk3 = dt * dkdx(t_n + dt/2, k_n + kk2/2, u=u_n + uk2/2, nuT=nuT)
+            kk3 = dt * dkdx(t_n + dt/2, k_n + kk2/2, du=u_n + uk2/2, nuT=nuT)
 
-            nuT = self.turbulence_model.calculate_nuT(x=t_n + dt, k=k_n + kk3, return_nuT=True)
+            nuT = self.turbulence_model.calculate_nuT(x=t_n + dt, k=k_n + kk3, du=u_n + uk3, return_nuT=True)
             
             uk4 = dt * dudx(t_n + dt, u_n + uk3, nuT=nuT)
-            kk4 = dt * dkdx(t_n + dt, k_n + kk3, u=u_n + uk3, nuT=nuT)
+            kk4 = dt * dkdx(t_n + dt, k_n + kk3, du=u_n + uk3, nuT=nuT)
 
             u_n1 = u_n + 1/6 * (uk1 + 2*uk2 + 2*uk3 + uk4)
             k_n1 = k_n + 1/6 * (kk1 + 2*kk2 + 2*kk3 + kk4)
